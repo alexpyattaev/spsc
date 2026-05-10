@@ -5,9 +5,9 @@
 //! power-of-two length. Indices are computed as `monotonic_counter & mask`.
 
 use crate::atomic_waker::AtomicWaker;
+use crate::sync::{AtomicBool, AtomicUsize};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// Crude cache-line padding — 64 covers x86_64; AArch64 prefers 128 but 64
 /// is a safe lower bound that still avoids false sharing in typical hardware.
@@ -134,7 +134,7 @@ impl<T> Drop for Inner<T> {
 unsafe impl<T: Send> Send for Inner<T> {}
 unsafe impl<T: Send> Sync for Inner<T> {}
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "shuttle-test")))]
 mod tests {
     use super::*;
 

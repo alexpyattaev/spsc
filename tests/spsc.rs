@@ -1,3 +1,9 @@
+// These tests use the std-atomic build of the queue. Under
+// `--features shuttle-test` the queue's atomics come from `shuttle::sync`
+// and panic outside `shuttle::check_*` — so this whole file is excluded
+// in that mode. See `tests/shuttle.rs` for the shuttle-only test suite.
+#![cfg(not(feature = "shuttle-test"))]
+
 use spsc::{channel, Closed, TryRecvError, TrySendError};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;

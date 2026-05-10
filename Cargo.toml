@@ -8,6 +8,14 @@ description = "Fixed-capacity async SPSC ringbuffer with bulk handles"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+shuttle = { version = "0.7", optional = true }
+
+[features]
+# Enable to swap in `shuttle::sync` atomics + `Arc` and run randomized
+# concurrency exploration via the tests in `tests/shuttle.rs`. Build with
+# `cargo test --features shuttle-test`. Cannot be combined with the
+# normal test suite — shuttle atomics panic outside `shuttle::check_*`.
+shuttle-test = ["dep:shuttle"]
 
 [dev-dependencies]
 criterion = "0.5"

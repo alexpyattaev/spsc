@@ -5,8 +5,8 @@
 //! waker, but the protocol must still resolve `register`/`wake` races without
 //! losing a wake).
 
+use crate::sync::AtomicUsize;
 use std::cell::UnsafeCell;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
 use std::task::Waker;
 

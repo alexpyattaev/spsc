@@ -1,18 +1,17 @@
 //! Producer side of the SPSC channel.
 
-use crate::inner::Inner;
 use crate::Closed;
+use crate::inner::Inner;
+use crate::sync::{Arc, Ordering};
 use std::future::poll_fn;
 use std::mem::MaybeUninit;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-/// Single-producer half of the channel.
+/// Producer half of the channel.
 ///
 /// `try_push` and the bulk write APIs all take `&mut self`, statically
-/// guaranteeing the SPSC invariant on the producer side.
+/// guaranteeing the SPSC invariant on the channel.
 pub struct Producer<T> {
     inner: Arc<Inner<T>>,
     /// Producer's view of its own monotonic write counter. Always equal to
@@ -157,10 +156,7 @@ impl<T> Producer<T> {
     }
 
     /// Async wait for at least `min` free slots.
-    pub async fn bulk_write_async(
-        &mut self,
-        min: usize,
-    ) -> Result<WriteHandle<'_, T>, Closed> {
+    pub async fn bulk_write_async(&mut self, min: usize) -> Result<WriteHandle<'_, T>, Closed> {
         assert!(
             min > 0 && min <= self.inner.capacity,
             "min must be in 1..=capacity, got {min} (capacity {})",
@@ -174,11 +170,7 @@ impl<T> Producer<T> {
         })
     }
 
-    fn poll_writable(
-        &mut self,
-        cx: &mut Context<'_>,
-        min: usize,
-    ) -> Poll<Result<(), Closed>> {
+    fn poll_writable(&mut self, cx: &mut Context<'_>, min: usize) -> Poll<Result<(), Closed>> {
         // First check.
         self.refresh_cached_read();
         if self.cached_free() >= min {
@@ -273,9 +265,7 @@ impl<'a, T> WriteHandle<'a, T> {
     /// Two `&mut [MaybeUninit<T>]` slices covering the writable region.
     /// The second slice is non-empty only when the writable region wraps
     /// around the buffer end. Logical write order: first slice, then second.
-    pub fn as_uninit_slices_mut(
-        &mut self,
-    ) -> (&mut [MaybeUninit<T>], &mut [MaybeUninit<T>]) {
+    pub fn as_uninit_slices_mut(&mut self) -> (&mut [MaybeUninit<T>], &mut [MaybeUninit<T>]) {
         let cap = self.producer.inner.capacity;
         let mask = self.producer.inner.mask;
         let start = self.producer.local_write & mask;

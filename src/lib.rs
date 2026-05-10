@@ -42,8 +42,9 @@ mod atomic_waker;
 mod consumer;
 mod inner;
 mod producer;
+mod sync;
 
-use std::sync::Arc;
+use crate::sync::Arc;
 
 pub use consumer::{Consumer, ReadHandle, TryRecvError};
 pub use producer::{Producer, TrySendError, WriteHandle};

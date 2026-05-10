@@ -1,10 +1,9 @@
 //! Consumer side of the SPSC channel.
 
 use crate::inner::Inner;
+use crate::sync::{Arc, Ordering};
 use crate::Closed;
 use std::future::poll_fn;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -83,9 +82,18 @@ impl<T> Consumer<T> {
     /// Try to pop one element.
     pub fn try_pop(&mut self) -> Result<T, TryRecvError> {
         if self.cached_len() == 0 {
+            // Order matters: load `producer_alive` BEFORE the write
+            // counter. If we observe alive=false, the Acquire load
+            // synchronizes-with the producer's `Drop` SC store, and
+            // therefore the subsequent `write` load sees the final
+            // value. If we did it the other way we could observe a
+            // stale write counter together with a fresh alive=false
+            // and miss elements that the producer pushed before
+            // dropping.
+            let alive = self.is_producer_alive();
             self.refresh_cached_write();
             if self.cached_len() == 0 {
-                return if self.is_producer_alive() {
+                return if alive {
                     Err(TryRecvError::Empty)
                 } else {
                     Err(TryRecvError::Closed)
@@ -140,16 +148,20 @@ impl<T> Consumer<T> {
             self.inner.capacity
         );
         loop {
+            // Load alive first so that a fresh alive=false ⇒ subsequent
+            // write load sees the final value (see `try_pop` for the
+            // ordering rationale).
+            let alive = self.is_producer_alive();
             self.refresh_cached_write();
             let avail = self.cached_len();
-            if avail >= min || (avail > 0 && !self.is_producer_alive()) {
+            if avail >= min || (avail > 0 && !alive) {
                 return Ok(ReadHandle {
                     consumer: self,
                     available: avail,
                     committed: 0,
                 });
             }
-            if !self.is_producer_alive() {
+            if !alive {
                 return Err(Closed);
             }
             std::thread::sleep(poll);
@@ -181,12 +193,14 @@ impl<T> Consumer<T> {
         cx: &mut Context<'_>,
         min: usize,
     ) -> Poll<Result<(), Closed>> {
+        // Load alive first (see `try_pop` ordering note).
+        let alive = self.is_producer_alive();
         self.refresh_cached_write();
         let avail = self.cached_len();
         if avail >= min {
             return Poll::Ready(Ok(()));
         }
-        if !self.is_producer_alive() {
+        if !alive {
             return Poll::Ready(if avail > 0 { Ok(()) } else { Err(Closed) });
         }
 
@@ -199,6 +213,7 @@ impl<T> Consumer<T> {
             .consumer_wake_pending
             .store(true, Ordering::SeqCst);
 
+        let alive = self.is_producer_alive();
         self.cached_write = self.inner.write.0.load(Ordering::SeqCst);
         let avail = self.cached_len();
         if avail >= min {
@@ -207,7 +222,7 @@ impl<T> Consumer<T> {
                 .store(false, Ordering::Release);
             return Poll::Ready(Ok(()));
         }
-        if !self.is_producer_alive() {
+        if !alive {
             self.inner
                 .consumer_wake_pending
                 .store(false, Ordering::Release);
