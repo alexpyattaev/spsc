@@ -127,6 +127,99 @@ fn bulk_write_read_wraps_around() {
 }
 
 #[test]
+fn read_handle_slices_split_at_wrap() {
+    // Force the consumer's live range to cross the buffer-end boundary,
+    // then check that `as_slices()` returns the correct (non-empty,
+    // ordered) first/second halves.
+    //
+    // Capacity 4. Push 3, drain 3 → write=3, read=3. Push 4 more (20..24)
+    // → write=7, read=3. Live range [3, 7) maps to slot indices 3, 0, 1, 2.
+    let (mut tx, mut rx) = channel::<u32>(4);
+    for i in 0..3 {
+        tx.try_push(10 + i).unwrap();
+    }
+    for _ in 0..3 {
+        rx.try_pop().unwrap();
+    }
+    for i in 0..4 {
+        tx.try_push(20 + i).unwrap();
+    }
+    let mut h = rx.try_bulk_read().unwrap();
+    assert_eq!(h.len(), 4);
+    let (a, b) = h.as_slices();
+    assert_eq!(a.len(), 1, "expected 1-elem first slice covering slot 3");
+    assert_eq!(b.len(), 3, "expected 3-elem second slice covering slots 0..3");
+    assert_eq!(a, &[20], "first slice contents in slot 3 = first pushed value");
+    assert_eq!(b, &[21, 22, 23], "second slice contents in logical order");
+    h.consume(4);
+    assert!(rx.try_bulk_read().is_none());
+}
+
+#[test]
+fn read_handle_slices_no_wrap() {
+    // Live range fully within the buffer end ⇒ second slice is empty.
+    let (mut tx, mut rx) = channel::<u32>(8);
+    for i in 0..5 {
+        tx.try_push(i).unwrap();
+    }
+    let h = rx.try_bulk_read().unwrap();
+    let (a, b) = h.as_slices();
+    assert_eq!(a, &[0, 1, 2, 3, 4]);
+    assert!(
+        b.is_empty(),
+        "expected empty second slice with no wrap, got {b:?}"
+    );
+}
+
+#[test]
+fn write_handle_uninit_slices_split_at_wrap() {
+    // Mirror of `read_handle_slices_split_at_wrap` for the write side.
+    // Capacity 4. Push 3, drain 3 → write=3, read=3. Now the producer's
+    // 4 free slots are [3, 7) which maps to slot indices 3, 0, 1, 2 —
+    // wrap on the first slot.
+    let (mut tx, mut rx) = channel::<u32>(4);
+    for i in 0..3 {
+        tx.try_push(i).unwrap();
+    }
+    for _ in 0..3 {
+        rx.try_pop().unwrap();
+    }
+
+    let mut h = tx.try_bulk_write().unwrap();
+    assert_eq!(h.capacity(), 4);
+    let (a, b) = h.as_uninit_slices_mut();
+    assert_eq!(a.len(), 1, "expected 1-elem first slice covering slot 3");
+    assert_eq!(b.len(), 3, "expected 3-elem second slice covering slots 0..3");
+    a[0].write(100);
+    b[0].write(200);
+    b[1].write(201);
+    b[2].write(202);
+    h.commit(4);
+
+    // Pop in logical write order — first slice first, then second.
+    assert_eq!(rx.try_pop(), Ok(100));
+    assert_eq!(rx.try_pop(), Ok(200));
+    assert_eq!(rx.try_pop(), Ok(201));
+    assert_eq!(rx.try_pop(), Ok(202));
+}
+
+#[test]
+fn write_handle_uninit_slices_no_wrap() {
+    // Fresh channel: writable region [0, capacity) doesn't wrap.
+    let (mut tx, _rx) = channel::<u32>(8);
+    let mut h = tx.try_bulk_write().unwrap();
+    assert_eq!(h.capacity(), 8);
+    let (a, b) = h.as_uninit_slices_mut();
+    assert_eq!(a.len(), 8);
+    assert!(
+        b.is_empty(),
+        "expected empty second slice with no wrap, got len {}",
+        b.len()
+    );
+    // No commit — handle drops, slots remain free.
+}
+
+#[test]
 fn handle_drop_without_commit_is_noop() {
     let (mut tx, mut rx) = channel::<u32>(4);
     tx.try_push(1).unwrap();
