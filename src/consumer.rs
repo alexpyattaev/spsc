@@ -3,7 +3,7 @@
 use crate::inner::Inner;
 use crate::Closed;
 use std::future::poll_fn;
-use std::sync::atomic::{fence, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -190,39 +190,28 @@ impl<T> Consumer<T> {
             return Poll::Ready(if avail > 0 { Ok(()) } else { Err(Closed) });
         }
 
-        self.inner
-            .consumer_needs_wake
-            .store(true, Ordering::Release);
+        // Park: register waker, then recheck. The AtomicWaker `register`
+        // is an AcqRel RMW; combined with the producer's wake-side
+        // `take()` RMW on the same waker state, that pair gives us the
+        // cross-thread synchronization we need without a separate flag.
         self.inner.consumer_waker.register(cx.waker());
-        fence(Ordering::SeqCst);
 
         self.refresh_cached_write();
         let avail = self.cached_len();
         if avail >= min {
-            self.inner
-                .consumer_needs_wake
-                .store(false, Ordering::Release);
             return Poll::Ready(Ok(()));
         }
         if !self.is_producer_alive() {
-            self.inner
-                .consumer_needs_wake
-                .store(false, Ordering::Release);
             return Poll::Ready(if avail > 0 { Ok(()) } else { Err(Closed) });
         }
         Poll::Pending
     }
 
-    /// Release-publish a new read counter and wake the producer if parked.
+    /// Release-publish a new read counter and unconditionally wake producer.
+    /// (DEBUG: always wake.)
     fn publish_read(&self, new_read: usize) {
         self.inner.read.0.store(new_read, Ordering::Release);
-        fence(Ordering::SeqCst);
-        if self.inner.producer_needs_wake.load(Ordering::Acquire) {
-            self.inner
-                .producer_needs_wake
-                .store(false, Ordering::Release);
-            self.inner.producer_waker.wake();
-        }
+        self.inner.producer_waker.wake();
     }
 }
 

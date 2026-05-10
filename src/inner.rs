@@ -32,16 +32,23 @@ pub(crate) struct Inner<T> {
     /// Consumer's monotonic read counter. Index = `read & mask`.
     pub read: CachePadded<AtomicUsize>,
 
-    /// Set by the consumer before parking; checked by the producer after
-    /// each commit so it can skip waker.wake() when nobody waits.
-    pub consumer_needs_wake: AtomicBool,
-    /// Symmetric flag for the producer side.
-    pub producer_needs_wake: AtomicBool,
-
-    /// Woken when the producer commits or drops.
-    pub consumer_waker: AtomicWaker,
+    /// Woken when the producer commits or drops. Padded into its own
+    /// cache line: the producer RMWs this on every commit, and we don't
+    /// want that to invalidate cache lines holding `mask` / `capacity`
+    /// or the other waker on the consumer side.
+    ///
+    /// We unconditionally call `wake()` on every commit. The cost when
+    /// nobody has registered is two AcqRel RMWs (`fetch_or` +
+    /// `fetch_and` on the waker state) returning the no-waker fast
+    /// path. An earlier version tried to guard the call with a
+    /// `needs_wake: AtomicBool` flag + `fence(SeqCst)`, but that was
+    /// unsound — SC fences synchronize with each other only when there
+    /// is a *modifying* atomic op sequenced after each fence, which we
+    /// did not have. The flag could be read `false` while the parked
+    /// side never observed the new data → repeatable hang.
+    pub consumer_waker: CachePadded<AtomicWaker>,
     /// Woken when the consumer commits or drops.
-    pub producer_waker: AtomicWaker,
+    pub producer_waker: CachePadded<AtomicWaker>,
 
     /// Cleared when the producer is dropped.
     pub producer_alive: AtomicBool,
@@ -63,10 +70,8 @@ impl<T> Inner<T> {
             buffer: v.into_boxed_slice(),
             write: CachePadded(AtomicUsize::new(0)),
             read: CachePadded(AtomicUsize::new(0)),
-            consumer_needs_wake: AtomicBool::new(false),
-            producer_needs_wake: AtomicBool::new(false),
-            consumer_waker: AtomicWaker::new(),
-            producer_waker: AtomicWaker::new(),
+            consumer_waker: CachePadded(AtomicWaker::new()),
+            producer_waker: CachePadded(AtomicWaker::new()),
             producer_alive: AtomicBool::new(true),
             consumer_alive: AtomicBool::new(true),
         }

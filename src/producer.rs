@@ -4,7 +4,7 @@ use crate::inner::Inner;
 use crate::Closed;
 use std::future::poll_fn;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{fence, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -188,45 +188,32 @@ impl<T> Producer<T> {
             return Poll::Ready(Err(Closed));
         }
 
-        // Park: set flag, register waker, then SeqCst fence to pair with
-        // the consumer's commit-side fence (store-load barrier).
-        self.inner
-            .producer_needs_wake
-            .store(true, Ordering::Release);
+        // Park: register waker, then recheck. The AtomicWaker register
+        // is an AcqRel RMW which (combined with the consumer's wake-side
+        // RMW) provides the cross-thread synchronization we need without
+        // a separate flag + fence pair.
         self.inner.producer_waker.register(cx.waker());
-        fence(Ordering::SeqCst);
 
-        // Recheck under the new ordering — the SeqCst fence guarantees that
-        // if the consumer's commit happened before our flag set, we observe
-        // it on this load.
+        // Recheck. Since `register` is an RMW on the waker state and
+        // `consumer.publish_read` performs a wake-side RMW on the same
+        // state, any data published before that wake is visible here.
+        // For the case where the consumer hasn't yet published anything,
+        // our caller will simply re-poll on its next wake.
         self.refresh_cached_read();
         if self.cached_free() >= min {
-            self.inner
-                .producer_needs_wake
-                .store(false, Ordering::Release);
             return Poll::Ready(Ok(()));
         }
         if !self.is_consumer_alive() {
-            self.inner
-                .producer_needs_wake
-                .store(false, Ordering::Release);
             return Poll::Ready(Err(Closed));
         }
         Poll::Pending
     }
 
-    /// Release-publish a new write counter and wake the consumer if it
-    /// has parked. The SeqCst fence pairs with the consumer's fence after
-    /// `consumer_needs_wake.store(true, Release)` to prevent missed wakes.
+    /// Release-publish a new write counter and unconditionally wake the
+    /// consumer. (DEBUG: always wake instead of using needs_wake flag.)
     fn publish_write(&self, new_write: usize) {
         self.inner.write.0.store(new_write, Ordering::Release);
-        fence(Ordering::SeqCst);
-        if self.inner.consumer_needs_wake.load(Ordering::Acquire) {
-            self.inner
-                .consumer_needs_wake
-                .store(false, Ordering::Release);
-            self.inner.consumer_waker.wake();
-        }
+        self.inner.consumer_waker.wake();
     }
 }
 
