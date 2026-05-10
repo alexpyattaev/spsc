@@ -57,7 +57,8 @@
 //! type (`std::mem::ManuallyDrop`, a custom `PanicGuard`, etc.) before
 //! being sent through the queue.
 
-#![forbid(unsafe_op_in_unsafe_fn)]
+// `unsafe_op_in_unsafe_fn` is hard-on by default under edition 2024,
+// no explicit `#![forbid(...)]` needed.
 
 mod atomic_waker;
 mod consumer;

@@ -3,7 +3,7 @@
 [package]
 name = "spsc"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "Fixed-capacity async SPSC ringbuffer with bulk handles"
 license = "MIT OR Apache-2.0"
 
@@ -20,6 +20,7 @@ shuttle-test = ["dep:shuttle"]
 
 [dev-dependencies]
 criterion = "0.5"
+rand = { version = "0.9", features = ["small_rng"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 
 [[bench]]

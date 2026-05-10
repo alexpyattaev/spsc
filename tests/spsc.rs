@@ -4,6 +4,7 @@
 // in that mode. See `tests/shuttle.rs` for the shuttle-only test suite.
 #![cfg(not(feature = "shuttle-test"))]
 
+use rand::SeedableRng;
 use spsc::{channel, Closed, TryRecvError, TrySendError};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -198,28 +199,16 @@ fn drop_counts_in_flight_and_committed() {
 
 // ---- Order preservation under contention ----
 
-/// Stateless SplitMix64 generator. Same algorithm as the one shipped with
-/// the C++ standard's `linear_congruential_engine`; suitable for cheap
-/// reproducible jitter on tests.
-fn splitmix(mut state: u64) -> impl FnMut() -> u64 {
-    move || {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-}
-
-/// On average one sleep per ~4096 iterations of jittered amount up to ~1 ms.
+/// On average one sleep per ~4096 iterations, of jittered amount up to ~1 ms.
 /// With 10M iterations that's ~2400 sleep events per side at ~500 µs mean,
 /// well above the per-iter cost of try_push/try_pop, so each sleep lets the
 /// other side fully fill or drain the buffer — naturally exercising the
 /// "producer faster", "consumer faster", and balanced regimes.
 #[inline]
-fn maybe_jitter(rng: &mut impl FnMut() -> u64) {
-    if (rng() & 0x0FFF) == 0 {
-        let us = rng() & 0x3FF;
+fn maybe_jitter(rng: &mut rand::rngs::SmallRng) {
+    use rand::Rng;
+    if rng.random_ratio(1, 4096) {
+        let us = rng.random_range(0..1024);
         std::thread::sleep(Duration::from_micros(us));
     }
 }
@@ -231,7 +220,7 @@ fn fifo_order_single_element_under_contention() {
     let (mut tx, mut rx) = spsc::channel::<u64>(CAP);
 
     let prod = thread::spawn(move || {
-        let mut rng = splitmix(0xCAFE_BABE_DEAD_BEEF);
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(0xCAFE_BABE_DEAD_BEEF);
         for i in 0..N {
             maybe_jitter(&mut rng);
             while tx.try_push(i).is_err() {
@@ -240,7 +229,7 @@ fn fifo_order_single_element_under_contention() {
         }
     });
 
-    let mut rng = splitmix(0x0123_4567_89AB_CDEF);
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(0x0123_4567_89AB_CDEF);
     let mut expected = 0u64;
     while expected < N {
         match rx.try_pop() {
@@ -268,19 +257,20 @@ fn fifo_order_bulk_under_contention() {
     let (mut tx, mut rx) = spsc::channel::<u64>(CAP);
 
     let prod = thread::spawn(move || {
-        let mut rng = splitmix(0x1357_9BDF_2468_ACE0);
+        use rand::Rng;
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(0x1357_9BDF_2468_ACE0);
         let mut next = 0u64;
         while next < N {
             maybe_jitter(&mut rng);
             // Random batch size 1..=16, clamped to remaining.
-            let want = ((rng() % 16) + 1).min(N - next) as usize;
+            let want = (rng.random_range(1..=16) as u64).min(N - next) as usize;
 
             // Spin until we have a handle with `want` slots free.
             let mut h = loop {
-                if let Some(h) = tx.try_bulk_write() {
-                    if h.capacity() >= want {
-                        break h;
-                    }
+                if let Some(h) = tx.try_bulk_write()
+                    && h.capacity() >= want
+                {
+                    break h;
                 }
                 std::hint::spin_loop();
             };
@@ -293,12 +283,13 @@ fn fifo_order_bulk_under_contention() {
         }
     });
 
-    let mut rng = splitmix(0x2468_ACE0_1357_9BDF);
+    use rand::Rng;
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(0x2468_ACE0_1357_9BDF);
     let mut expected = 0u64;
     while expected < N {
         maybe_jitter(&mut rng);
         // Random max-read 1..=16 per handle; consumer reads at most that.
-        let max_take = ((rng() % 16) + 1) as usize;
+        let max_take = rng.random_range(1..=16);
         if let Some(mut h) = rx.try_bulk_read() {
             let (a, b) = h.as_slices();
             let mut consumed = 0usize;
