@@ -407,7 +407,6 @@ fn drop_does_not_touch_uncommitted_bulk_write_slots() {
 fn drop_either_end_first_works() {
     // Inner::drop runs on the last Arc reference, regardless of which
     // half went away first. Verify both orderings drop the same set.
-    use std::sync::atomic::{AtomicUsize, Ordering};
     static DROPS: AtomicUsize = AtomicUsize::new(0);
     #[derive(Debug)]
     struct D;

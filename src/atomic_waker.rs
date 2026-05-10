@@ -1,9 +1,9 @@
-//! Single-registrar `AtomicWaker`, vendored to keep this crate dependency-free.
+//! Single-registrar `AtomicWaker` vendored inline.
 //!
-//! Behaviour mirrors the public `atomic-waker` crate. Exactly one party calls
-//! `register`; any number of parties may call `wake` (we only ever have one
-//! waker, but the protocol must still resolve `register`/`wake` races without
-//! losing a wake).
+//! Behaviour mirrors the `atomic-waker` crate. Exactly one party calls
+//! `register` (the parking side); `wake` may run concurrently. The protocol
+//! resolves register/wake races by having `register` deliver the wake itself
+//! when it observes that a concurrent `take` ran during its critical section.
 
 use crate::sync::AtomicUsize;
 use std::cell::UnsafeCell;
@@ -81,7 +81,7 @@ impl AtomicWaker {
         }
     }
 
-    pub fn take(&self) -> Option<Waker> {
+    fn take(&self) -> Option<Waker> {
         match self.state.fetch_or(WAKING, AcqRel) {
             WAITING => {
                 // SAFETY: we hold the WAKING bit; `waker` is exclusive.

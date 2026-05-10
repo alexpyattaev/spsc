@@ -167,7 +167,6 @@ impl<T> Producer<T> {
     }
 
     fn poll_writable(&mut self, cx: &mut Context<'_>, min: usize) -> Poll<Result<(), Closed>> {
-        // First check.
         self.refresh_cached_read();
         if self.cached_free() >= min {
             return Poll::Ready(Ok(()));
@@ -226,9 +225,12 @@ impl<T> Producer<T> {
 
 impl<T> Drop for Producer<T> {
     fn drop(&mut self) {
-        // SeqCst so a concurrent consumer's fenced recheck definitely sees us.
+        // SeqCst so a concurrent consumer's `is_producer_alive` Acquire
+        // load observes us, and `Consumer::try_pop` (which loads alive
+        // *before* the write counter) drains correctly.
         self.inner.producer_alive.store(false, Ordering::SeqCst);
-        // Always wake on close
+        // Always wake the consumer on close — bypasses `consumer_wake_pending`
+        // because the closing thread can't reliably observe its state.
         self.inner.consumer_waker.wake();
     }
 }

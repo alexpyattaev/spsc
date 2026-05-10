@@ -85,10 +85,13 @@ pub struct Closed;
 /// capacity via [`Producer::capacity`] / [`Consumer::capacity`].
 ///
 /// # Panics
-/// Panics if `capacity == 0`.
+/// Panics if `capacity == 0`, or if rounding up overflows `usize`
+/// (i.e. `capacity > 1 << (usize::BITS - 1)`).
 pub fn channel<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     assert!(capacity > 0, "capacity must be > 0");
-    let cap = capacity.next_power_of_two();
+    let cap = capacity
+        .checked_next_power_of_two()
+        .expect("capacity rounds up past usize::MAX");
     let inner = Arc::new(Inner::<T>::with_capacity(cap));
     (Producer::new(inner.clone()), Consumer::new(inner))
 }

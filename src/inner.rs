@@ -2,9 +2,8 @@
 //!
 //! `Inner<T>` lives inside an `Arc<Inner<T>>` shared by `Producer` and
 //! `Consumer`. The buffer is a `Box<[UnsafeCell<MaybeUninit<T>>]>` of fixed,
-//! power-of-two length. Indices are computed based on monothonic counters,
-//! wrapped around the channel length via bitmasking. This way ringbuffer
-//! math becomes trivial.
+//! power-of-two length. Indices are computed by bitmasking monotonic
+//! counters with `capacity - 1`, so ringbuffer math becomes trivial.
 
 use crate::atomic_waker::AtomicWaker;
 use crate::sync::{AtomicBool, AtomicUsize};

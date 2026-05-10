@@ -233,6 +233,9 @@ impl<T> Consumer<T> {
 
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
+        // Mirror of `Producer::drop`. SeqCst store so the producer's
+        // alive-load sees us; unconditional wake so a parked producer
+        // unblocks even if `producer_wake_pending` happens to be unset.
         self.inner.consumer_alive.store(false, Ordering::SeqCst);
         self.inner.producer_waker.wake();
     }
