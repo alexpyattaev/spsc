@@ -23,25 +23,17 @@ pub struct Producer<T> {
     cached_read: usize,
 }
 
-/// Reason a non-blocking push failed.
-#[derive(Debug, PartialEq, Eq)]
+/// Reason a non-blocking push failed. The unsent value is returned in the
+/// error variant so the caller can recover it.
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum TrySendError<T> {
     /// Buffer full; consumer has not freed enough space.
+    #[error("channel full")]
     Full(T),
     /// Consumer has been dropped.
+    #[error("channel closed")]
     Closed(T),
 }
-
-impl<T> std::fmt::Display for TrySendError<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TrySendError::Full(_) => f.write_str("channel full"),
-            TrySendError::Closed(_) => f.write_str("channel closed"),
-        }
-    }
-}
-
-impl<T: std::fmt::Debug> std::error::Error for TrySendError<T> {}
 
 impl<T> Producer<T> {
     pub(crate) fn new(inner: Arc<Inner<T>>) -> Self {
@@ -126,13 +118,17 @@ impl<T> Producer<T> {
     /// Park-and-poll until at least `min` slots are free, sleeping 1 ms
     /// between polls. Returns `Closed` if the consumer drops.
     pub fn bulk_write_blocking(&mut self, min: usize) -> Result<WriteHandle<'_, T>, Closed> {
-        self.bulk_write_blocking_with(min, Duration::from_millis(1))
+        self.bulk_write_blocking_with_interval(min, Duration::from_millis(1))
     }
 
-    pub fn bulk_write_blocking_with(
+    /// Like [`bulk_write_blocking`] but with a caller-supplied sleep
+    /// duration between polls.
+    ///
+    /// [`bulk_write_blocking`]: Producer::bulk_write_blocking
+    pub fn bulk_write_blocking_with_interval(
         &mut self,
         min: usize,
-        poll: Duration,
+        interval: Duration,
     ) -> Result<WriteHandle<'_, T>, Closed> {
         assert!(
             min > 0 && min <= self.inner.capacity,
@@ -151,7 +147,7 @@ impl<T> Producer<T> {
             if !self.is_consumer_alive() {
                 return Err(Closed);
             }
-            std::thread::sleep(poll);
+            std::thread::sleep(interval);
         }
     }
 
@@ -213,11 +209,7 @@ impl<T> Producer<T> {
     ///
     /// Correctness rests on the four-way SC pattern (this store, the
     /// consumer's flag store, this flag load, the consumer's data
-    /// recheck load all SeqCst). On x86 the SC store costs ~XCHG
-    /// (~20-30 cycles) and the SC load is a regular MOV (free under
-    /// TSO). That replaces the unconditional ~80-cycle pair of LOCKed
-    /// RMWs that the previous always-wake design did inside
-    /// `AtomicWaker::wake()`.
+    /// recheck load all SeqCst).
     fn publish_write(&self, new_write: usize) {
         self.inner.write.0.store(new_write, Ordering::SeqCst);
         if self.inner.consumer_wake_pending.load(Ordering::SeqCst) {
@@ -236,13 +228,13 @@ impl<T> Drop for Producer<T> {
     fn drop(&mut self) {
         // SeqCst so a concurrent consumer's fenced recheck definitely sees us.
         self.inner.producer_alive.store(false, Ordering::SeqCst);
-        // Always wake on close — cheaper than fencing through `needs_wake`.
+        // Always wake on close
         self.inner.consumer_waker.wake();
     }
 }
 
 /// Bulk write handle. Holds an exclusive borrow of the `Producer` so at most
-/// one is live at a time. Drop without calling [`commit`] is harmless: no
+/// one is alive at a time. Drop without calling [`commit`] is harmless: no
 /// counter advance, no published data, slots remain "free" from the queue's
 /// perspective (any `MaybeUninit` writes the user did into the slices are
 /// silently discarded).
@@ -271,7 +263,7 @@ impl<'a, T> WriteHandle<'a, T> {
         let start = self.producer.local_write & mask;
         let first_len = (cap - start).min(self.free);
         let second_len = self.free - first_len;
-        let base = self.producer.inner.buffer_base();
+        let base = self.producer.inner.buffer_base_ptr();
         // SAFETY: `[start..start+first_len) ∪ [0..second_len)` is a subset of
         // the producer's exclusive `[write, write+free)` range. UnsafeCell
         // gives us write provenance through `base`. No shared/overlapping

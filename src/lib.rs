@@ -17,7 +17,7 @@
 //! if let Some(mut handle) = rx.try_bulk_read() {
 //!     let (a, b) = handle.as_slices();
 //!     let sum: u32 = a.iter().chain(b.iter()).sum();
-//!     handle.commit(handle.len());            // drop all
+//!     handle.consume(handle.len());           // drop all
 //! }
 //! ```
 //!
@@ -35,6 +35,27 @@
 //!     handle.commit(n);
 //! }
 //! ```
+//!
+//! ## Assumption: `T::drop` does not panic
+//!
+//! The queue runs `T`'s destructor in three places:
+//!
+//! - `Consumer::try_pop` (move-out via `assume_init_read`, then drop on
+//!   the popped value).
+//! - `ReadHandle::consume(n)` (`drop_in_place` on each of the `n` consumed
+//!   slots, in a loop).
+//! - `Inner::drop` (drop every element still in `[read, write)` when both
+//!   halves are gone).
+//!
+//! All three paths assume `<T as Drop>::drop` does not unwind. A panic in
+//! a `T` destructor inside `ReadHandle::consume` or `Inner::drop` would
+//! leak the rest of the in-flight elements (we don't `catch_unwind` the
+//! drop loop) and, if it occurs while `Inner::drop` is already running,
+//! abort the process (double-panic). This matches the convention that
+//! `Drop` impls are infallible — keep payload destructors panic-free.
+//! `T`s with potentially-panicking drops should be wrapped in a guard
+//! type (`std::mem::ManuallyDrop`, a custom `PanicGuard`, etc.) before
+//! being sent through the queue.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -53,16 +74,9 @@ use inner::Inner;
 
 /// Returned when the channel's peer half has been dropped and the operation
 /// cannot make progress.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+#[error("channel peer dropped")]
 pub struct Closed;
-
-impl std::fmt::Display for Closed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("channel peer dropped")
-    }
-}
-
-impl std::error::Error for Closed {}
 
 /// Allocate a bounded SPSC channel.
 ///

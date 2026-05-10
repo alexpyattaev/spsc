@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 shuttle = { version = "0.7", optional = true }
+thiserror = "2"
 
 [features]
 # Enable to swap in `shuttle::sync` atomics + `Arc` and run randomized

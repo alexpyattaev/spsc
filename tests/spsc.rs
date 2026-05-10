@@ -92,7 +92,7 @@ fn bulk_write_read_wraps_around() {
         assert_eq!(h.len(), 5);
         let (a, b) = h.as_slices();
         assert_eq!([a, b].concat(), vec![100, 101, 102, 103, 104]);
-        h.commit(4);
+        h.consume(4);
     }
     // Push 6 more → wraps. write was at 5, now at 11; read at 4. len = 7.
     {
@@ -117,7 +117,7 @@ fn bulk_write_read_wraps_around() {
         got.extend(a.iter().copied());
         got.extend(b.iter().copied());
         let n = h.len();
-        h.commit(n);
+        h.consume(n);
     }
     assert_eq!(
         got,
@@ -183,17 +183,273 @@ fn drop_counts_in_flight_and_committed() {
         let _ = rx.try_pop().unwrap();
         assert_eq!(DROPS.load(Ordering::Relaxed), 2);
 
-        // Commit one via bulk handle (drops in place).
+        // Consume one via bulk handle (drops in place).
         {
             let mut h = rx.try_bulk_read().unwrap();
             assert_eq!(h.len(), 3);
-            h.commit(1);
+            h.consume(1);
         }
         assert_eq!(DROPS.load(Ordering::Relaxed), 3);
 
         // Leave 2 elements in the queue; channel drop must drop them.
     }
     assert_eq!(DROPS.load(Ordering::Relaxed), 5);
+}
+
+// ---- Order preservation under contention ----
+
+/// Stateless SplitMix64 generator. Same algorithm as the one shipped with
+/// the C++ standard's `linear_congruential_engine`; suitable for cheap
+/// reproducible jitter on tests.
+fn splitmix(mut state: u64) -> impl FnMut() -> u64 {
+    move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
+/// On average one sleep per ~4096 iterations of jittered amount up to ~1 ms.
+/// With 10M iterations that's ~2400 sleep events per side at ~500 µs mean,
+/// well above the per-iter cost of try_push/try_pop, so each sleep lets the
+/// other side fully fill or drain the buffer — naturally exercising the
+/// "producer faster", "consumer faster", and balanced regimes.
+#[inline]
+fn maybe_jitter(rng: &mut impl FnMut() -> u64) {
+    if (rng() & 0x0FFF) == 0 {
+        let us = rng() & 0x3FF;
+        std::thread::sleep(Duration::from_micros(us));
+    }
+}
+
+#[test]
+fn fifo_order_single_element_under_contention() {
+    const N: u64 = 10_000_000;
+    const CAP: usize = 1024;
+    let (mut tx, mut rx) = spsc::channel::<u64>(CAP);
+
+    let prod = thread::spawn(move || {
+        let mut rng = splitmix(0xCAFE_BABE_DEAD_BEEF);
+        for i in 0..N {
+            maybe_jitter(&mut rng);
+            while tx.try_push(i).is_err() {
+                std::hint::spin_loop();
+            }
+        }
+    });
+
+    let mut rng = splitmix(0x0123_4567_89AB_CDEF);
+    let mut expected = 0u64;
+    while expected < N {
+        match rx.try_pop() {
+            Ok(v) => {
+                // assert_eq! formatting on every successful pop would
+                // dominate the test runtime; check cheaply, format only
+                // on failure.
+                if v != expected {
+                    panic!("FIFO violation: expected {expected}, got {v}");
+                }
+                expected += 1;
+            }
+            Err(_) => std::hint::spin_loop(),
+        }
+        maybe_jitter(&mut rng);
+    }
+    prod.join().unwrap();
+    assert_eq!(expected, N);
+}
+
+#[test]
+fn fifo_order_bulk_under_contention() {
+    const N: u64 = 10_000_000;
+    const CAP: usize = 1024;
+    let (mut tx, mut rx) = spsc::channel::<u64>(CAP);
+
+    let prod = thread::spawn(move || {
+        let mut rng = splitmix(0x1357_9BDF_2468_ACE0);
+        let mut next = 0u64;
+        while next < N {
+            maybe_jitter(&mut rng);
+            // Random batch size 1..=16, clamped to remaining.
+            let want = ((rng() % 16) + 1).min(N - next) as usize;
+
+            // Spin until we have a handle with `want` slots free.
+            let mut h = loop {
+                if let Some(h) = tx.try_bulk_write() {
+                    if h.capacity() >= want {
+                        break h;
+                    }
+                }
+                std::hint::spin_loop();
+            };
+            let (a, b) = h.as_uninit_slices_mut();
+            for (i, slot) in a.iter_mut().chain(b.iter_mut()).take(want).enumerate() {
+                slot.write(next + i as u64);
+            }
+            h.commit(want);
+            next += want as u64;
+        }
+    });
+
+    let mut rng = splitmix(0x2468_ACE0_1357_9BDF);
+    let mut expected = 0u64;
+    while expected < N {
+        maybe_jitter(&mut rng);
+        // Random max-read 1..=16 per handle; consumer reads at most that.
+        let max_take = ((rng() % 16) + 1) as usize;
+        if let Some(mut h) = rx.try_bulk_read() {
+            let (a, b) = h.as_slices();
+            let mut consumed = 0usize;
+            for &v in a.iter().chain(b.iter()).take(max_take) {
+                if v != expected {
+                    panic!("FIFO violation: expected {expected}, got {v}");
+                }
+                expected += 1;
+                consumed += 1;
+            }
+            h.consume(consumed);
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+    prod.join().unwrap();
+    assert_eq!(expected, N);
+}
+
+#[test]
+fn drop_in_flight_with_counter_wraparound() {
+    // Force the monotonic counters past `capacity` so the live range
+    // `[read, write)` wraps the buffer end. If `Inner::drop` iterated
+    // raw slot indices instead of monotonic counters it would either
+    // double-drop or skip elements; if it dropped the wrong slots it
+    // would call `assume_init_drop` on uninitialized memory.
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    #[derive(Debug)]
+    struct D(#[allow(dead_code)] u32);
+    impl Drop for D {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    DROPS.store(0, Ordering::Relaxed);
+    {
+        let (mut tx, mut rx) = spsc::channel::<D>(4);
+        // Push 4, drain 4 → write=4, read=4. No wrap yet but cursors at end.
+        for i in 0..4 {
+            tx.try_push(D(i)).unwrap();
+        }
+        for _ in 0..4 {
+            let _ = rx.try_pop().unwrap();
+        }
+        assert_eq!(DROPS.load(Ordering::Relaxed), 4);
+
+        // Push 6 with intermediate drains so the live range wraps:
+        // write 4→5, drain → read=5; then push 5,6,7,8,9 in batches.
+        for i in 4..10 {
+            while tx.try_push(D(i)).is_err() {
+                // shouldn't happen with this drain pattern, but yield
+                std::hint::spin_loop();
+            }
+            if i < 7 {
+                let _ = rx.try_pop().unwrap();
+            }
+        }
+        // State: 6 pushed, 3 drained → 3 remaining (values 7,8,9).
+        // local_write = 10, local_read = 7. Live range [7, 10) wraps:
+        // slot indices 7&3=3, 8&3=0, 9&3=1.
+        assert_eq!(rx.len(), 3);
+
+        // After this point we have 6 + 4 - 1 = 9 drops accumulated
+        // (the original 4 + 5 from the in-loop pops).
+        assert_eq!(DROPS.load(Ordering::Relaxed), 4 + 3);
+
+        // Drop the channel. Inner::drop must drop the 3 remaining,
+        // visiting slots 3, 0, 1 in monotonic order.
+    }
+    assert_eq!(
+        DROPS.load(Ordering::Relaxed),
+        10,
+        "Inner::drop missed elements across the wrap boundary"
+    );
+}
+
+#[test]
+fn drop_does_not_touch_uncommitted_bulk_write_slots() {
+    // The user may write into MaybeUninit slots from a WriteHandle and
+    // then drop the handle without committing. Those slots are
+    // OUTSIDE [read, write) and the queue must not run Drop on them
+    // (it can't tell whether the user actually initialised them).
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct CountOnDrop;
+    impl Drop for CountOnDrop {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    DROPS.store(0, Ordering::Relaxed);
+    {
+        let (mut tx, _rx) = spsc::channel::<CountOnDrop>(4);
+        let mut h = tx.try_bulk_write().unwrap();
+        let (a, _b) = h.as_uninit_slices_mut();
+        // "Initialise" two slots, then drop the handle without commit.
+        // The values written here MUST be considered leaked from the
+        // queue's perspective — Inner::drop must not touch slots
+        // outside [read, write).
+        a[0].write(CountOnDrop);
+        a[1].write(CountOnDrop);
+        // Handle drops here without commit; local_write unchanged.
+    }
+    // We deliberately leak two CountOnDrop instances by writing
+    // without committing. The queue must NOT have dropped them.
+    assert_eq!(
+        DROPS.load(Ordering::Relaxed),
+        0,
+        "Inner::drop touched uncommitted slots — would be UB on partially-initialised data"
+    );
+}
+
+#[test]
+fn drop_either_end_first_works() {
+    // Inner::drop runs on the last Arc reference, regardless of which
+    // half went away first. Verify both orderings drop the same set.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    #[derive(Debug)]
+    struct D;
+    impl Drop for D {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // Producer dropped first.
+    DROPS.store(0, Ordering::Relaxed);
+    {
+        let (mut tx, rx) = spsc::channel::<D>(4);
+        tx.try_push(D).unwrap();
+        tx.try_push(D).unwrap();
+        drop(tx);
+        // rx still alive; Inner not yet dropped.
+        assert_eq!(DROPS.load(Ordering::Relaxed), 0);
+        drop(rx);
+    }
+    assert_eq!(DROPS.load(Ordering::Relaxed), 2);
+
+    // Consumer dropped first.
+    DROPS.store(0, Ordering::Relaxed);
+    {
+        let (mut tx, rx) = spsc::channel::<D>(4);
+        tx.try_push(D).unwrap();
+        tx.try_push(D).unwrap();
+        drop(rx);
+        assert_eq!(DROPS.load(Ordering::Relaxed), 0);
+        drop(tx);
+    }
+    assert_eq!(DROPS.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -241,7 +497,7 @@ fn blocking_recv_returns_partial_when_producer_drops() {
     assert_eq!(h.len(), 1);
     let (a, _b) = h.as_slices();
     assert_eq!(a, &[7]);
-    h.commit(1);
+    h.consume(1);
     t.join().unwrap();
     let res = rx.bulk_read_blocking(1);
     assert!(matches!(res, Err(Closed)));
@@ -273,7 +529,7 @@ async fn async_roundtrip() {
                 got += 1;
             }
             let n = h.len();
-            h.commit(n);
+            h.consume(n);
         }
     });
 

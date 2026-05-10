@@ -1,8 +1,8 @@
 //! Consumer side of the SPSC channel.
 
+use crate::Closed;
 use crate::inner::Inner;
 use crate::sync::{Arc, Ordering};
-use crate::Closed;
 use std::future::poll_fn;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -19,24 +19,15 @@ pub struct Consumer<T> {
 }
 
 /// Reason a non-blocking pop failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TryRecvError {
     /// Nothing available right now; producer still alive.
+    #[error("channel empty")]
     Empty,
     /// Producer dropped and buffer empty.
+    #[error("channel closed")]
     Closed,
 }
-
-impl std::fmt::Display for TryRecvError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            TryRecvError::Empty => "channel empty",
-            TryRecvError::Closed => "channel closed",
-        })
-    }
-}
-
-impl std::error::Error for TryRecvError {}
 
 impl<T> Consumer<T> {
     pub(crate) fn new(inner: Arc<Inner<T>>) -> Self {
@@ -122,25 +113,26 @@ impl<T> Consumer<T> {
         Some(ReadHandle {
             consumer: self,
             available: avail,
-            committed: 0,
+            consumed: 0,
         })
     }
 
-    /// Park-and-poll until at least `min` elements are available, sleeping
+    /// Block until at least `min` elements are available, sleeping
     /// 1 ms between polls. If the producer drops while elements remain, the
     /// handle is returned with whatever's there (possibly fewer than `min`).
-    /// Returns `Closed` only if the producer drops and the buffer is empty.
-    pub fn bulk_read_blocking(
-        &mut self,
-        min: usize,
-    ) -> Result<ReadHandle<'_, T>, Closed> {
-        self.bulk_read_blocking_with(min, Duration::from_millis(1))
+    /// Returns `Closed` if the producer was dropped and the buffer is empty.
+    pub fn bulk_read_blocking(&mut self, min: usize) -> Result<ReadHandle<'_, T>, Closed> {
+        self.bulk_read_blocking_with_interval(min, Duration::from_millis(1))
     }
 
-    pub fn bulk_read_blocking_with(
+    /// Like [`bulk_read_blocking`] but with a caller-supplied sleep
+    /// duration between polls.
+    ///
+    /// [`bulk_read_blocking`]: Consumer::bulk_read_blocking
+    pub fn bulk_read_blocking_with_interval(
         &mut self,
         min: usize,
-        poll: Duration,
+        interval: Duration,
     ) -> Result<ReadHandle<'_, T>, Closed> {
         assert!(
             min > 0 && min <= self.inner.capacity,
@@ -158,22 +150,19 @@ impl<T> Consumer<T> {
                 return Ok(ReadHandle {
                     consumer: self,
                     available: avail,
-                    committed: 0,
+                    consumed: 0,
                 });
             }
             if !alive {
                 return Err(Closed);
             }
-            std::thread::sleep(poll);
+            std::thread::sleep(interval);
         }
     }
 
     /// Async wait for at least `min` elements. Producer-drop semantics match
     /// `bulk_read_blocking`.
-    pub async fn bulk_read_async(
-        &mut self,
-        min: usize,
-    ) -> Result<ReadHandle<'_, T>, Closed> {
+    pub async fn bulk_read_async(&mut self, min: usize) -> Result<ReadHandle<'_, T>, Closed> {
         assert!(
             min > 0 && min <= self.inner.capacity,
             "min must be in 1..=capacity, got {min} (capacity {})",
@@ -184,15 +173,11 @@ impl<T> Consumer<T> {
         Ok(ReadHandle {
             consumer: self,
             available: avail,
-            committed: 0,
+            consumed: 0,
         })
     }
 
-    fn poll_readable(
-        &mut self,
-        cx: &mut Context<'_>,
-        min: usize,
-    ) -> Poll<Result<(), Closed>> {
+    fn poll_readable(&mut self, cx: &mut Context<'_>, min: usize) -> Poll<Result<(), Closed>> {
         // Load alive first (see `try_pop` ordering note).
         let alive = self.is_producer_alive();
         self.refresh_cached_write();
@@ -256,34 +241,34 @@ impl<T> Drop for Consumer<T> {
 /// Bulk read handle. Holds an exclusive borrow of the `Consumer`.
 ///
 /// The handle does **not** copy elements — `as_slices` returns shared
-/// references into the ringbuffer. `commit(n)` drops the first `n`
+/// references into the ringbuffer. `consume(n)` drops the first `n`
 /// elements in place and frees their slots for the producer.
 ///
-/// Dropping a handle with uncommitted elements leaves them in the queue,
+/// Dropping a handle with unconsumed elements leaves them in the queue,
 /// available on the next read.
-#[must_use = "ReadHandle does nothing unless commit() is called"]
+#[must_use = "ReadHandle does nothing unless consume() is called"]
 pub struct ReadHandle<'a, T> {
     consumer: &'a mut Consumer<T>,
     /// Total elements available at handle creation.
     available: usize,
-    /// How many have been committed via `commit`.
-    committed: usize,
+    /// How many have been removed via `consume`.
+    consumed: usize,
 }
 
 impl<'a, T> ReadHandle<'a, T> {
-    /// Uncommitted element count.
+    /// Number of elements still in the handle's view (`available - consumed`).
     #[inline]
     pub fn len(&self) -> usize {
-        self.available - self.committed
+        self.available - self.consumed
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Two slice views over the uncommitted region. Second slice is
-    /// non-empty only when the region wraps. Logical order: first then
-    /// second.
+    /// Two slice views over the remaining (not-yet-consumed) region.
+    /// Second slice is non-empty only when the region wraps. Logical
+    /// order: first then second.
     pub fn as_slices(&self) -> (&[T], &[T]) {
         let cap = self.consumer.inner.capacity;
         let mask = self.consumer.inner.mask;
@@ -291,7 +276,7 @@ impl<'a, T> ReadHandle<'a, T> {
         let len = self.len();
         let first_len = (cap - start).min(len);
         let second_len = len - first_len;
-        let base = self.consumer.inner.buffer_base().cast::<T>();
+        let base = self.consumer.inner.buffer_base_ptr().cast::<T>();
         // SAFETY: slots `[start..start+first_len) ∪ [0..second_len)` are all
         // within the consumer's exclusive `[read, read+available)` range
         // and contain initialised `T` values. The producer never writes
@@ -303,18 +288,15 @@ impl<'a, T> ReadHandle<'a, T> {
         }
     }
 
-    /// Drop the first `n` uncommitted elements in place and publish the new
-    /// read counter so the producer can reuse those slots. Wakes a parked
+    /// Drop the first `n` elements in place and publish the new read
+    /// counter so the producer can reuse those slots. Wakes a parked
     /// producer.
     ///
     /// # Panics
     /// Panics if `n > self.len()`.
-    pub fn commit(&mut self, n: usize) {
+    pub fn consume(&mut self, n: usize) {
         let remaining = self.len();
-        assert!(
-            n <= remaining,
-            "commit({n}) exceeds available {remaining}"
-        );
+        assert!(n <= remaining, "consume({n}) exceeds available {remaining}");
         if n == 0 {
             return;
         }
@@ -328,7 +310,7 @@ impl<'a, T> ReadHandle<'a, T> {
             unsafe { (*self.consumer.inner.slot_ptr(idx)).assume_init_drop() };
         }
         self.consumer.local_read = start.wrapping_add(n);
-        self.committed += n;
+        self.consumed += n;
         self.consumer.publish_read(self.consumer.local_read);
     }
 }

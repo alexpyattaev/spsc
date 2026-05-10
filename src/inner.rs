@@ -2,15 +2,16 @@
 //!
 //! `Inner<T>` lives inside an `Arc<Inner<T>>` shared by `Producer` and
 //! `Consumer`. The buffer is a `Box<[UnsafeCell<MaybeUninit<T>>]>` of fixed,
-//! power-of-two length. Indices are computed as `monotonic_counter & mask`.
+//! power-of-two length. Indices are computed based on monothonic counters,
+//! wrapped around the channel length via bitmasking. This way ringbuffer
+//! math becomes trivial.
 
 use crate::atomic_waker::AtomicWaker;
 use crate::sync::{AtomicBool, AtomicUsize};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 
-/// Crude cache-line padding — 64 covers x86_64; AArch64 prefers 128 but 64
-/// is a safe lower bound that still avoids false sharing in typical hardware.
+/// Crude cache-line padding — 64 covers x86_64, other arch may need more/less.
 #[repr(align(64))]
 pub(crate) struct CachePadded<T>(pub T);
 
@@ -23,8 +24,11 @@ impl<T> std::ops::Deref for CachePadded<T> {
 }
 
 pub(crate) struct Inner<T> {
+    /// Total capacity of the ringbuffer
     pub capacity: usize,
+    /// Mask applied to counters to get actual indices (function of capacity)
     pub mask: usize,
+    /// Actual ringbuffer
     buffer: Box<[UnsafeCell<MaybeUninit<T>>]>,
 
     /// Producer's monotonic write counter. Index = `write & mask`.
@@ -32,30 +36,30 @@ pub(crate) struct Inner<T> {
     /// Consumer's monotonic read counter. Index = `read & mask`.
     pub read: CachePadded<AtomicUsize>,
 
-    /// Woken when the producer commits *and* `consumer_wake_pending` is
-    /// observed `true`. Padded into its own cache line because each
-    /// register/take is an AcqRel RMW on this; we don't want that to
-    /// invalidate cache lines holding `mask` / `capacity`.
+    /// Registered by the consumer when it parks in `poll_readable`;
+    /// woken by the producer in `publish_write` whenever
+    /// `consumer_wake_pending` is observed `true`. Cache-line padded
+    /// because every `register`/`take` is an AcqRel RMW on the waker
+    /// state, and we don't want that to invalidate lines holding
+    /// `mask` / `capacity` / the other waker.
     pub consumer_waker: CachePadded<AtomicWaker>,
-    /// Symmetric for the producer.
+    /// Registered by the producer when it parks in `poll_writable`;
+    /// woken by the consumer in `publish_read` whenever
+    /// `producer_wake_pending` is observed `true`. Cache-line padded
+    /// for the same reason as `consumer_waker`.
     pub producer_waker: CachePadded<AtomicWaker>,
 
     /// Set by the consumer just before it parks (in `poll_readable`),
     /// cleared by the producer when it consumes the wake event in
-    /// `publish_write`. Both accesses are SeqCst — combined with the
-    /// SeqCst store of the write counter on commit and the SeqCst load
-    /// of the write counter on the consumer's recheck, this gives the
-    /// Dekker-style guarantee that if the consumer parks (sets the
-    /// flag) the producer must wake (sees the flag).
-    ///
-    /// An earlier version of this used Release/Acquire on these flags
-    /// plus a `fence(SeqCst)` between data store and flag check. That
-    /// was unsound: SC fences only synchronize across threads when a
-    /// *modifying* atomic op is sequenced after each fence, which we
-    /// did not have. Result: a missed wake → consumer hung forever.
-    /// All-SC on the four ops involved is the cheapest correct fix.
+    /// `publish_write`. Both accesses are SeqCst - relaxing them is
+    /// not justified here.
     pub consumer_wake_pending: AtomicBool,
-    /// Symmetric for the producer.
+    /// Set by the producer just before it parks (in `poll_writable`),
+    /// cleared by the consumer when it consumes the wake event in
+    /// `publish_read`. Same SeqCst pattern as
+    /// `consumer_wake_pending` but with the roles flipped: when the
+    /// producer parks (flag set), the consumer's next commit must
+    /// observe the flag and call wake.
     pub producer_wake_pending: AtomicBool,
 
     /// Cleared when the producer is dropped.
@@ -74,7 +78,7 @@ impl<T> Inner<T> {
         v.resize_with(cap, || UnsafeCell::new(MaybeUninit::<T>::uninit()));
         Self {
             capacity: cap,
-            mask: cap - 1,
+            mask: cap - 1, // ones for bits we use as indices
             buffer: v.into_boxed_slice(),
             write: CachePadded(AtomicUsize::new(0)),
             read: CachePadded(AtomicUsize::new(0)),
@@ -102,7 +106,7 @@ impl<T> Inner<T> {
     /// Base pointer of the buffer as `*mut MaybeUninit<T>`. Valid because
     /// `UnsafeCell<X>` has the same layout as `X`.
     #[inline]
-    pub(crate) fn buffer_base(&self) -> *mut MaybeUninit<T> {
+    pub(crate) fn buffer_base_ptr(&self) -> *mut MaybeUninit<T> {
         self.buffer.as_ptr() as *mut UnsafeCell<MaybeUninit<T>> as *mut MaybeUninit<T>
     }
 }
@@ -146,7 +150,7 @@ mod tests {
     #[test]
     fn buffer_base_offset_eq_slot_ptr() {
         let inner = Inner::<u32>::with_capacity(8);
-        let base = inner.buffer_base();
+        let base = inner.buffer_base_ptr();
         for i in 0..8 {
             // SAFETY: i < capacity.
             let p = unsafe { inner.slot_ptr(i) };
