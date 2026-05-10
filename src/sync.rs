@@ -1,6 +1,6 @@
 //! Synchronization primitives used by the queue.
 //!
-//! Under the `shuttle-test` feature these come from the [`shuttle`] crate so
+//! Under the `shuttle-test` feature these come from the `shuttle` crate so
 //! that randomized scheduling can intercept every load/store/RMW. Otherwise
 //! they're just `std::sync` re-exports.
 //!
