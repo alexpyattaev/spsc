@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "spsc"
+version = "0.1.0"
+edition = "2021"
+description = "Fixed-capacity async SPSC ringbuffer with bulk handles"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
