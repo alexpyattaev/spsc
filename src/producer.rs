@@ -188,32 +188,55 @@ impl<T> Producer<T> {
             return Poll::Ready(Err(Closed));
         }
 
-        // Park: register waker, then recheck. The AtomicWaker register
-        // is an AcqRel RMW which (combined with the consumer's wake-side
-        // RMW) provides the cross-thread synchronization we need without
-        // a separate flag + fence pair.
+        // Park: register waker, set wake_pending with SeqCst, then
+        // recheck the read counter with SeqCst. By the four-way SC
+        // pattern (consumer's commit does SC-store of `read` + SC-load
+        // of producer_wake_pending), if we end up returning Pending,
+        // the consumer's next commit must observe our wake_pending
+        // flag and call wake.
         self.inner.producer_waker.register(cx.waker());
+        self.inner
+            .producer_wake_pending
+            .store(true, Ordering::SeqCst);
 
-        // Recheck. Since `register` is an RMW on the waker state and
-        // `consumer.publish_read` performs a wake-side RMW on the same
-        // state, any data published before that wake is visible here.
-        // For the case where the consumer hasn't yet published anything,
-        // our caller will simply re-poll on its next wake.
-        self.refresh_cached_read();
+        // SC recheck.
+        self.cached_read = self.inner.read.0.load(Ordering::SeqCst);
         if self.cached_free() >= min {
+            self.inner
+                .producer_wake_pending
+                .store(false, Ordering::Release);
             return Poll::Ready(Ok(()));
         }
         if !self.is_consumer_alive() {
+            self.inner
+                .producer_wake_pending
+                .store(false, Ordering::Release);
             return Poll::Ready(Err(Closed));
         }
         Poll::Pending
     }
 
-    /// Release-publish a new write counter and unconditionally wake the
-    /// consumer. (DEBUG: always wake instead of using needs_wake flag.)
+    /// SeqCst-publish a new write counter, then SeqCst-load the
+    /// consumer's wake-pending flag and call wake() only if set.
+    ///
+    /// Correctness rests on the four-way SC pattern (this store, the
+    /// consumer's flag store, this flag load, the consumer's data
+    /// recheck load all SeqCst). On x86 the SC store costs ~XCHG
+    /// (~20-30 cycles) and the SC load is a regular MOV (free under
+    /// TSO). That replaces the unconditional ~80-cycle pair of LOCKed
+    /// RMWs that the previous always-wake design did inside
+    /// `AtomicWaker::wake()`.
     fn publish_write(&self, new_write: usize) {
-        self.inner.write.0.store(new_write, Ordering::Release);
-        self.inner.consumer_waker.wake();
+        self.inner.write.0.store(new_write, Ordering::SeqCst);
+        if self.inner.consumer_wake_pending.load(Ordering::SeqCst) {
+            // Clear the flag before waking. A racing consumer that
+            // re-parks after this clear will set the flag again with
+            // SeqCst, so the next commit will see it.
+            self.inner
+                .consumer_wake_pending
+                .store(false, Ordering::Release);
+            self.inner.consumer_waker.wake();
+        }
     }
 }
 

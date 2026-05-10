@@ -16,3 +16,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", 
 [[bench]]
 name = "throughput"
 harness = false
+
+# Release build with debug info + frame pointers for perf profiling.
+[profile.release]
+debug = "line-tables-only"
+# `force-frame-pointers = true` would be ideal but is unstable; instead set
+# RUSTFLAGS="-C force-frame-pointers=yes" before building when running perf.

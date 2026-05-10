@@ -190,28 +190,44 @@ impl<T> Consumer<T> {
             return Poll::Ready(if avail > 0 { Ok(()) } else { Err(Closed) });
         }
 
-        // Park: register waker, then recheck. The AtomicWaker `register`
-        // is an AcqRel RMW; combined with the producer's wake-side
-        // `take()` RMW on the same waker state, that pair gives us the
-        // cross-thread synchronization we need without a separate flag.
+        // Park: register waker, set wake_pending with SeqCst, then SC
+        // recheck the write counter. By the four-way SC pattern (see
+        // Producer::publish_write), if we go Pending the producer's
+        // next commit must observe our flag and call wake.
         self.inner.consumer_waker.register(cx.waker());
+        self.inner
+            .consumer_wake_pending
+            .store(true, Ordering::SeqCst);
 
-        self.refresh_cached_write();
+        self.cached_write = self.inner.write.0.load(Ordering::SeqCst);
         let avail = self.cached_len();
         if avail >= min {
+            self.inner
+                .consumer_wake_pending
+                .store(false, Ordering::Release);
             return Poll::Ready(Ok(()));
         }
         if !self.is_producer_alive() {
+            self.inner
+                .consumer_wake_pending
+                .store(false, Ordering::Release);
             return Poll::Ready(if avail > 0 { Ok(()) } else { Err(Closed) });
         }
         Poll::Pending
     }
 
-    /// Release-publish a new read counter and unconditionally wake producer.
-    /// (DEBUG: always wake.)
+    /// SeqCst-publish the read counter, then SeqCst-check the
+    /// producer's wake-pending flag and wake only if set.  See the
+    /// matching comment on `Producer::publish_write` for the four-way
+    /// SC argument that makes this sound.
     fn publish_read(&self, new_read: usize) {
-        self.inner.read.0.store(new_read, Ordering::Release);
-        self.inner.producer_waker.wake();
+        self.inner.read.0.store(new_read, Ordering::SeqCst);
+        if self.inner.producer_wake_pending.load(Ordering::SeqCst) {
+            self.inner
+                .producer_wake_pending
+                .store(false, Ordering::Release);
+            self.inner.producer_waker.wake();
+        }
     }
 }
 

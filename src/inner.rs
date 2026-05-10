@@ -32,23 +32,31 @@ pub(crate) struct Inner<T> {
     /// Consumer's monotonic read counter. Index = `read & mask`.
     pub read: CachePadded<AtomicUsize>,
 
-    /// Woken when the producer commits or drops. Padded into its own
-    /// cache line: the producer RMWs this on every commit, and we don't
-    /// want that to invalidate cache lines holding `mask` / `capacity`
-    /// or the other waker on the consumer side.
-    ///
-    /// We unconditionally call `wake()` on every commit. The cost when
-    /// nobody has registered is two AcqRel RMWs (`fetch_or` +
-    /// `fetch_and` on the waker state) returning the no-waker fast
-    /// path. An earlier version tried to guard the call with a
-    /// `needs_wake: AtomicBool` flag + `fence(SeqCst)`, but that was
-    /// unsound — SC fences synchronize with each other only when there
-    /// is a *modifying* atomic op sequenced after each fence, which we
-    /// did not have. The flag could be read `false` while the parked
-    /// side never observed the new data → repeatable hang.
+    /// Woken when the producer commits *and* `consumer_wake_pending` is
+    /// observed `true`. Padded into its own cache line because each
+    /// register/take is an AcqRel RMW on this; we don't want that to
+    /// invalidate cache lines holding `mask` / `capacity`.
     pub consumer_waker: CachePadded<AtomicWaker>,
-    /// Woken when the consumer commits or drops.
+    /// Symmetric for the producer.
     pub producer_waker: CachePadded<AtomicWaker>,
+
+    /// Set by the consumer just before it parks (in `poll_readable`),
+    /// cleared by the producer when it consumes the wake event in
+    /// `publish_write`. Both accesses are SeqCst — combined with the
+    /// SeqCst store of the write counter on commit and the SeqCst load
+    /// of the write counter on the consumer's recheck, this gives the
+    /// Dekker-style guarantee that if the consumer parks (sets the
+    /// flag) the producer must wake (sees the flag).
+    ///
+    /// An earlier version of this used Release/Acquire on these flags
+    /// plus a `fence(SeqCst)` between data store and flag check. That
+    /// was unsound: SC fences only synchronize across threads when a
+    /// *modifying* atomic op is sequenced after each fence, which we
+    /// did not have. Result: a missed wake → consumer hung forever.
+    /// All-SC on the four ops involved is the cheapest correct fix.
+    pub consumer_wake_pending: AtomicBool,
+    /// Symmetric for the producer.
+    pub producer_wake_pending: AtomicBool,
 
     /// Cleared when the producer is dropped.
     pub producer_alive: AtomicBool,
@@ -72,6 +80,8 @@ impl<T> Inner<T> {
             read: CachePadded(AtomicUsize::new(0)),
             consumer_waker: CachePadded(AtomicWaker::new()),
             producer_waker: CachePadded(AtomicWaker::new()),
+            consumer_wake_pending: AtomicBool::new(false),
+            producer_wake_pending: AtomicBool::new(false),
             producer_alive: AtomicBool::new(true),
             consumer_alive: AtomicBool::new(true),
         }
